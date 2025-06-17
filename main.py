@@ -11,16 +11,33 @@ from torch.utils.tensorboard import SummaryWriter
 import time
 
 # -------------------------- Hyperparameters -------------------------- #
+# DEFAULTS = dict(
+#     gamma=0.99,
+#     lr=1e-3,
+#     buffer_size=100_000,
+#     batch_size=128,
+#     epsilon_start=1.0,
+#     epsilon_end=0.05,
+#     epsilon_decay_steps=250_000,  # frames, not episodes
+#     target_update_tau=0.005,
+#     train_freq=4,  # gradient step every n env steps
+#     warmup_steps=10_000,
+#     episodes=1000,
+#     max_steps=1000,
+#     eval_interval=50,
+#     seed=42,
+# )
+
 DEFAULTS = dict(
     gamma=0.99,
-    lr=1e-3,
+    lr=3e-4,                    # ↓ lower LR for stabler updates
     buffer_size=100_000,
-    batch_size=128,
+    batch_size=256,             # ↑ larger mini-batches
     epsilon_start=1.0,
     epsilon_end=0.05,
-    epsilon_decay_steps=250_000,  # frames, not episodes
-    target_update_tau=0.005,
-    train_freq=4,  # gradient step every n env steps
+    epsilon_decay_steps=75_000, # ↓ faster ε-decay (≈300 eps → ε≈0.1)
+    target_update_tau=0.001,    # ↓ slightly faster target tracking
+    train_freq=1,               # update every env step
     warmup_steps=10_000,
     episodes=1000,
     max_steps=1000,
@@ -38,11 +55,11 @@ class QNetwork(nn.Module):
     def __init__(self, obs_size: int, n_actions: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(obs_size, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, n_actions),
+            nn.Linear(obs_size, 256), #first hidden
+            nn.ReLU(), #activation
+            nn.Linear(256, 256), # second hidden
+            nn.ReLU(),  #activation
+            nn.Linear(256, n_actions),  # output layer
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
