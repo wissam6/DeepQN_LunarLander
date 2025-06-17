@@ -109,8 +109,15 @@ class DQNAgent:
         self.env = env
         self.device = torch.device("cuda" if torch.cuda.is_available() and cfg.cuda else "cpu")
 
-        obs_size = env.single_observation_space.shape[0]
-        n_actions = env.single_action_space.n
+        # obs_size = env.single_observation_space.shape[0]
+        # n_actions = env.single_action_space.n
+        
+        if hasattr(env, "single_observation_space"):      # vector-env path
+            obs_size  = env.single_observation_space.shape[0]
+            n_actions = env.single_action_space.n
+        else:                                             # classic env
+            obs_size  = env.observation_space.shape[0]
+            n_actions = env.action_space.n
 
         self.q_net = QNetwork(obs_size, n_actions).to(self.device)
         self.target_net = QNetwork(obs_size, n_actions).to(self.device)
@@ -125,7 +132,12 @@ class DQNAgent:
 
     def select_action(self, state):
         if np.random.rand() < self.epsilon:
-            return self.env.single_action_space.sample()
+            if hasattr(self.env, "single_action_space"):
+                return self.env.single_action_space.sample()   # vector env
+            else:
+                return self.env.action_space.sample()          # classic env
+        
+        
         with torch.no_grad():
             state = torch.tensor(state, device=self.device).unsqueeze(0)
             q_values = self.q_net(state)
@@ -255,7 +267,9 @@ def parse_args():
 
 def main():
     args = parse_args()
-    cfg = argparse.Namespace(**DEFAULTS, **vars(args))
+    # cfg = argparse.Namespace(**DEFAULTS, **vars(args))
+    cfg_dict = {**DEFAULTS, **vars(args)}   # later values overwrite earlier ones
+    cfg = argparse.Namespace(**cfg_dict) 
 
     env = make_env(cfg.seed)
     writer = SummaryWriter(cfg.logdir)
