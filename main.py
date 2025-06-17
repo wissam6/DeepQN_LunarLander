@@ -1,28 +1,4 @@
-# dqn_lunarlander.py
-"""
-Deep Q‑Network (DQN) implementation for Gymnasium's LunarLander‑v3 environment.
-
-Features
---------
-* PyTorch neural network with 2 hidden layers (256–256 ReLU)
-* Experience replay buffer with configurable capacity
-* Target‑network that is softly updated (Polyak averaging)
-* ε‑greedy policy with linear decay
-* Vectorised environment option for faster sampling (gymnasium.vector)
-* Automatic device selection (CPU/GPU)
-* Logging with TensorBoard (optional)
-* Save/Load checkpoints (state‑dicts)
-
-Run
----
-$ python dqn_lunarlander.py --episodes 1500 --cuda
-
-Author: <your‑name> 2025
-"""
-
 import argparse
-import math
-import os
 from collections import deque, namedtuple
 from typing import Tuple
 
@@ -32,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
+import time
 
 # -------------------------- Hyperparameters -------------------------- #
 DEFAULTS = dict(
@@ -209,8 +186,13 @@ class DQNAgent:
                 writer.add_scalar("eval/avg_reward", avg_r, ep)
                 print(f"Episode {ep:4d} | Reward {ep_reward:7.2f} | Eval {avg_r:7.2f} | ε {self.epsilon:.3f}")
 
+            if ep % 100 == 0:
+                # If you made watch a *method* of the agent:
+                self.watch(episodes=1)
+
             if (ep + 1) % 100 == 0:
                 self.save(f"checkpoint_ep{ep+1}.pth")
+                
 
     def evaluate(self, episodes=5):
         total_r = 0.0
@@ -225,6 +207,27 @@ class DQNAgent:
                 total_r += reward
                 done = terminated or truncated
         return total_r / episodes
+    
+    def watch(agent, episodes=3):
+    # A fresh env that opens a Pygame window
+        vis_env = gym.make("LunarLander-v3",
+                       continuous=False,
+                       render_mode="human")   # <- key line
+        for ep in range(episodes):
+            state, _ = vis_env.reset(seed=agent.cfg.seed)
+            done = False
+            ep_ret = 0
+            while not done:
+                with torch.no_grad():
+                    a = int(agent.q_net(torch.tensor(state,
+                                                 device=agent.device)
+                                        .unsqueeze(0)).argmax())
+                state, r, term, trunc, _ = vis_env.step(a)
+                done = term or trunc
+                ep_ret += r
+                time.sleep(0.03)  # ~30 FPS; adjust for your monitor
+            print(f"Episode {ep}: reward {ep_ret:.1f}")
+        vis_env.close()
 
     def save(self, path):
         torch.save(
