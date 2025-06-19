@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""
+Double + Dueling DQN for LunarLander-v3
+--------------------------------------
+• Dueling architecture  → value- & advantage-head
+• Double-DQN target     → online net chooses argmax, target net evaluates
+"""
+
+import argparse
+from collections import namedtuple
+from typing import Tuple
+import os, time
+
+import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+
+# -------------------------- Hyperparameters -------------------------- #
+DEFAULTS = dict(
+    gamma=0.99,
+    lr=3e-4,
+    buffer_size=100_000,
+    batch_size=256,
+    epsilon_start=1.0,
+    epsilon_end=0.05,
+    epsilon_decay_steps=75_000,
+    target_update_tau=0.001,
+    train_freq=1,
+    warmup_steps=10_000,
+    episodes=1000,
+    max_steps=1000,
+    eval_interval=50,
+    seed=42,
+)
+
+Transition = namedtuple(
+    "Transition", ("state", "action", "reward", "next_state", "done")
+)
+
+# ----------------------------- Dueling Network ----------------------------- #
+class QNetwork(nn.Module):
+    """
+    Shared MLP → value head V(s)  (1 unit)
+               → advantage head A(s,a) (n_actions units)
+    Q(s,a) = V + A − mean(A)
+    """
+    def __init__(self, obs_size: int, n_actions: int):
+        super().__init__()
+        self.feature = nn.Sequential(
+            nn.Linear(obs_size, 256), nn.ReLU(),
+            nn.Linear(256, 256),      nn.ReLU(),
+        )
+        self.value_head = nn.Linear(256, 1)
+        self.adv_head   = nn.Linear(256, n_actions)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.feature(x)
+        v = self.value_head(x)               # (B,1)
+        a = self.adv_head(x)                 # (B,A)
+        return v + a - a.mean(dim=1, keepdim=True)
+
+
+# ---------------------------- ReplayBuffer ---------------------------- #
+class ReplayBuffer:
+    def __init__(self, capacity: int, obs_shape: Tuple[int]):
+        self.capacity = capacity
+        self.obs_buf  = np.zeros((capacity, *obs_shape), dtype=np.float32)
+        self.next_obs_buf = np.zeros_like(self.obs_buf)
+        self.acts_buf = np.zeros((capacity, 1), dtype=np.int64)
+        self.rews_buf = np.zeros((capacity, 1), dtype=np.float32)
+        self.done_buf = np.zeros((capacity, 1), dtype=np.float32)
+        self.idx = 0
+        self.size = 0
+
+    def add(self, state, action, reward, next_state, done):
+        self.obs_buf[self.idx]  = state
+        self.acts_buf[self.idx] = action
+        self.rews_buf[self.idx] = reward
+        self.next_obs_buf[self.idx] = next_state
+        self.done_buf[self.idx] = done
+        self.idx  = (self.idx + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(self, batch_size: int, device: torch.device):
+        idxs = np.random.randint(0, self.size, size=batch_size)
+        obses      = torch.tensor(self.obs_buf[idxs],  device=device)
+        actions    = torch.tensor(self.acts_buf[idxs], device=device)
+        rewards    = torch.tensor(self.rews_buf[idxs], device=device)
+        next_obses = torch.tensor(self.next_obs_buf[idxs], device=device)
+        dones      = torch.tensor(self.done_buf[idxs],  device=device)
+        return obses, actions, rewards, next_obses, dones
+
+
+# -------------------------- DQN Agent -------------------------- #
+class DQNAgent:
+    def __init__(self, env, cfg):
+        self.env = env
+        self.device = torch.device("cuda" if torch.cuda.is_available() and cfg.cuda else "cpu")
+
+        if hasattr(env, "single_observation_space"):          # vector env
+            obs_size  = env.single_observation_space.shape[0]
+            n_actions = env.single_action_space.n
+        else:                                                 # classic env
+            obs_size  = env.observation_space.shape[0]
+            n_actions = env.action_space.n
+
+        self.q_net      = QNetwork(obs_size, n_actions).to(self.device)
+        self.target_net = QNetwork(obs_size, n_actions).to(self.device)
+        self.target_net.load_state_dict(self.q_net.state_dict())
+        self.target_net.eval()
+
+        self.optimizer = optim.Adam(self.q_net.parameters(), lr=cfg.lr)
+        self.buffer = ReplayBuffer(cfg.buffer_size, (obs_size,))
+        self.cfg = cfg
+        self.steps_done = 0
+        self.epsilon = cfg.epsilon_start
+
+    # -------------- interaction helpers --------------
+    def select_action(self, state):
+        if np.random.rand() < self.epsilon:
+            space = self.env.single_action_space if hasattr(self.env, "single_action_space") else self.env.action_space
+            return space.sample()
+        with torch.no_grad():
+            q = self.q_net(torch.tensor(state, device=self.device).unsqueeze(0))
+            return int(q.argmax(dim=1).item())
+
+    def update_epsilon(self):
+        frac = self.steps_done / self.cfg.epsilon_decay_steps
+        self.epsilon = max(self.cfg.epsilon_end,
+                           self.cfg.epsilon_start - (self.cfg.epsilon_start - self.cfg.epsilon_end) * frac)
+
+    # -------------- learning --------------
+    def learn(self):
+        if (self.buffer.size < self.cfg.batch_size or
+                self.steps_done < self.cfg.warmup_steps):
+            return
+
+        states, actions, rewards, next_states, dones = self.buffer.sample(
+            self.cfg.batch_size, self.device
+        )
+
+        # current Q
+        q_vals = self.q_net(states).gather(1, actions)
+
+        # -------- Double-DQN target --------
+        with torch.no_grad():
+            next_actions = self.q_net(next_states).argmax(1, keepdim=True)       # online net chooses
+            next_q_vals  = self.target_net(next_states).gather(1, next_actions)  # target net evaluates
+            target = rewards + self.cfg.gamma * (1 - dones) * next_q_vals
+
+        loss = nn.functional.smooth_l1_loss(q_vals, target)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.q_net.parameters(), 10.0)
+        self.optimizer.step()
+
+        # soft-update target network
+        with torch.no_grad():
+            for p, tp in zip(self.q_net.parameters(), self.target_net.parameters()):
+                tp.data.lerp_(p.data, self.cfg.target_update_tau)
+
+    # -------------- train / eval / watch --------------
+    def train(self, writer: SummaryWriter):
+        global_step = 0
+        for ep in range(self.cfg.episodes):
+            state, _ = self.env.reset(seed=self.cfg.seed)
+            ep_reward = 0.0
+            for _ in range(self.cfg.max_steps):
+                action = self.select_action(state)
+                next_state, reward, term, trunc, _ = self.env.step(action)
+                done = term or trunc
+                self.buffer.add(state, action, reward, next_state, float(done))
+
+                state = next_state
+                ep_reward += reward
+                self.learn()
+
+                self.steps_done += 1
+                global_step += 1
+                self.update_epsilon()
+                if done:
+                    break
+
+            # ---- logging ----
+            writer.add_scalar("train/episode_reward", ep_reward, ep)
+            writer.add_scalar("train/epsilon", self.epsilon, ep)
+
+            if ep % self.cfg.eval_interval == 0:
+                avg = self.evaluate(5)
+                writer.add_scalar("eval/avg_reward", avg, ep)
+                print(f"Ep {ep:4d} | R {ep_reward:7.2f} | Eval {avg:7.2f} | ε {self.epsilon:.3f}")
+
+            if ep % 100 == 0:
+                self.watch(episodes=1)
+            if (ep + 1) % 100 == 0:
+                self.save()
+
+    def evaluate(self, episodes=5):
+        total = 0.0
+        for _ in range(episodes):
+            state, _ = self.env.reset()
+            done = False
+            while not done:
+                with torch.no_grad():
+                    a = int(self.q_net(torch.tensor(state, device=self.device)
+                                       .unsqueeze(0)).argmax(dim=1))
+                state, r, term, trunc, _ = self.env.step(a)
+                total += r
+                done = term or trunc
+        return total / episodes
+
+    def watch(agent, episodes=3):
+        vis_env = gym.make("LunarLander-v3", continuous=False, render_mode="human")
+        for ep in range(episodes):
+            state, _ = vis_env.reset(seed=agent.cfg.seed)
+            done = False
+            ep_ret = 0
+            while not done:
+                with torch.no_grad():
+                    a = int(agent.q_net(torch.tensor(state, device=agent.device)
+                                        .unsqueeze(0)).argmax())
+                state, r, term, trunc, _ = vis_env.step(a)
+                done = term or trunc
+                ep_ret += r
+                time.sleep(0.03)
+            print(f"Episode {ep}: reward {ep_ret:.1f}")
+        vis_env.close()
+
+    def save(self, path=None):
+        if path is None:
+            path = os.path.join(self.cfg.checkpoint_dir, f"checkpoint_ep{self.steps_done}.pth")
+        torch.save(dict(
+            q_net=self.q_net.state_dict(),
+            target_net=self.target_net.state_dict(),
+            optimizer=self.optimizer.state_dict(),
+        ), path)
+
+    def load(self, path):
+        ckpt = torch.load(path, map_location=self.device)
+        self.q_net.load_state_dict(ckpt["q_net"])
+        self.target_net.load_state_dict(ckpt["target_net"])
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+
+
+# ---------------------------- Main script ---------------------------- #
+def make_env(seed: int, vectorized: bool = False):
+    if vectorized:
+        env = gym.vector.SyncVectorEnv(
+            [lambda: gym.make("LunarLander-v3", continuous=False) for _ in range(4)]
+        )
+    else:
+        env = gym.make("LunarLander-v3", continuous=False)
+    env.action_space.seed(seed)
+    env.observation_space.seed(seed)
+    return env
+
+
+def parse_args():
+    p = argparse.ArgumentParser("Double + Dueling DQN for LunarLander-v3")
+    p.add_argument("--episodes", type=int, default=DEFAULTS["episodes"])
+    p.add_argument("--cuda", action="store_true")
+    p.add_argument("--logdir", type=str, default="runs/dqn_lunarlander")
+    return p.parse_args()
+
+
+def main():
+    from datetime import datetime
+    args = parse_args()
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_name = f"dqn_lunarlander_{timestamp}"
+    checkpoint_dir = os.path.join("checkpoints", run_name)
+    log_dir = os.path.join(args.logdir, run_name)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+
+    cfg_dict = {**DEFAULTS, **vars(args),
+                "checkpoint_dir": checkpoint_dir,
+                "logdir": log_dir}
+    cfg = argparse.Namespace(**cfg_dict)
+
+    env = make_env(cfg.seed)
+    writer = SummaryWriter(cfg.logdir)
+
+    agent = DQNAgent(env, cfg)
+    try:
+        agent.train(writer)
+    finally:
+        env.close()
+        writer.close()
+
+
+if __name__ == "__main__":
+    main()
