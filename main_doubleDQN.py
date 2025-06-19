@@ -147,21 +147,27 @@ class DQNAgent:
         )
 
     def learn(self):
+        # wait until we have enough data / past warm-up
         if self.buffer.size < self.cfg.batch_size or self.steps_done < self.cfg.warmup_steps:
             return
 
-        (
-            states,
-            actions,
-            rewards,
-            next_states,
-            dones,
-        ) = self.buffer.sample(self.cfg.batch_size, self.device)
+        (states, actions, rewards, next_states, dones) = \
+            self.buffer.sample(self.cfg.batch_size, self.device)
 
+        # 1. current Q-values
         q_vals = self.q_net(states).gather(1, actions)
+
+        # 2. --------- Double DQN target ---------
+        #   a) action selection with *online* network
         with torch.no_grad():
-            next_q_vals = self.target_net(next_states).max(1, keepdim=True)[0]
+            next_actions = self.q_net(next_states).argmax(1, keepdim=True)
+
+            #   b) action evaluation with *target* network
+            next_q_vals = self.target_net(next_states).gather(1, next_actions)
+
             target = rewards + self.cfg.gamma * (1 - dones) * next_q_vals
+        # ----------------------------------------
+
         loss = nn.functional.smooth_l1_loss(q_vals, target)
 
         self.optimizer.zero_grad()
@@ -169,7 +175,7 @@ class DQNAgent:
         nn.utils.clip_grad_norm_(self.q_net.parameters(), 10.0)
         self.optimizer.step()
 
-        # Soft update target network
+        # soft-update target network (unchanged)
         with torch.no_grad():
             for p, tp in zip(self.q_net.parameters(), self.target_net.parameters()):
                 tp.data.lerp_(p.data, self.cfg.target_update_tau)
@@ -206,7 +212,7 @@ class DQNAgent:
 
             if ep % 100 == 0:
                 # If you made watch a *method* of the agent:
-                self.watch(episodes=3)
+                self.watch(episodes=1)
 
             if (ep + 1) % 100 == 0:
                 self.save()
