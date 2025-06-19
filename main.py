@@ -206,7 +206,7 @@ class DQNAgent:
 
             if ep % 100 == 0:
                 # If you made watch a *method* of the agent:
-                self.watch(episodes=3)
+                self.watch(episodes=1)
 
             if (ep + 1) % 100 == 0:
                 self.save()
